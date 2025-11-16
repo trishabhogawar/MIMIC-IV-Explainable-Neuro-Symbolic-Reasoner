@@ -1,0 +1,21 @@
+[
+  "hypotension_any",
+  "hypotension_hours",
+  "hypotension_first_hr",
+  "tachycardia_any",
+  "tachycardia_hours",
+  "tachycardia_first_hr",
+  "bradycardia_any",
+  "bradycardia_hours",
+  "bradycardia_first_hr",
+  "hypoxemia_any",
+  "hypoxemia_hours",
+  "hypoxemia_first_hr",
+  "fever_any",
+  "fever_hours",
+  "fever_first_hr",
+  "tachypnea_any",
+  "tachypnea_hours",
+  "tachypnea_first_hr",
+  "sbp_slope"
+]
