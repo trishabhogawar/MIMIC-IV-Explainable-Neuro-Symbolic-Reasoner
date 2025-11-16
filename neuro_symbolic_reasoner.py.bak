@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+import io, re, sys, shutil, pathlib
+
+TARGET = pathlib.Path("neuro_symbolic_reasoner.py")
+BACKUP = pathlib.Path("neuro_symbolic_reasoner.py.bak")
+
+if not TARGET.exists():
+    sys.exit("ERROR: neuro_symbolic_reasoner.py not found in current folder.")
+
+src = TARGET.read_text(encoding="utf-8")
+
+# 1) Remove any broken helper imports we previously added.
+src = re.sub(
+    r"\n?from\s+project_internal(?:_like)?\s+import\s*\([^\)]*\)\s*\n",
+    "\n", src, flags=re.MULTILINE
+)
+
+# 2) Inject helper block for patient-specific paths (idempotent: only if not present).
+if "get_patient_active_paths(" not in src:
+    helper_block = r'''
+# === Patient-specific causal paths helper (auto-injected) ===
+RULE_TO_NODE = {
+    "extreme_hypotension_z": "Shock",
+    "resp_failure_z": "RespiratoryFailure",
+    "systemic_inflammation_z": "Inflammation",
+    "aki_creatinine_z": "AKI",
+}
+
+def _rule_name(_r):
+    if isinstance(_r, dict):
+        return _r.get("name") or _r.get("rule") or _r.get("id") or ""
+    return str(_r)
+
+def _rule_weight(_r):
+    if isinstance(_r, dict):
+        try:
+            return float(_r.get("weight", 0.0))
+        except Exception:
+            return 0.0
+    return 0.0
+
+def _graph_direct_paths_to_mortality(graph):
+    _paths = []
+    if hasattr(graph, "get_direct_paths_to"):
+        _paths = graph.get_direct_paths_to("Mortality")
+    elif hasattr(graph, "direct_paths_to"):
+        _paths = graph.direct_paths_to("Mortality")
+    elif hasattr(graph, "direct_paths"):
+        try:
+            _paths = graph.direct_paths("Mortality")
+        except Exception:
+            _paths = []
+    _norm = []
+    for _p in _paths or []:
+        if isinstance(_p, (list, tuple)) and len(_p) == 2:
+            _norm.append([str(_p[0]), str(_p[1])])
+    return _norm
+
+def get_patient_active_paths(graph, fired_rules):
+    _direct = _graph_direct_paths_to_mortality(graph)
+    _active_nodes = set()
+    _weights = {}
+    for _r in (fired_rules or []):
+        _rn = _rule_name(_r)
+        _node = RULE_TO_NODE.get(_rn)
+        if _node:
+            _active_nodes.add(_node)
+            _weights[_node] = max(_weights.get(_node, 0.0), abs(_rule_weight(_r)))
+    _patient = [p for p in _direct if p[0] in _active_nodes]
+    _patient.sort(key=lambda p: _weights.get(p[0], 0.0), reverse=True)
+    return _patient, _direct
+# === End helper ===
+'''.lstrip("\n")
+
+    # place helper after the first import block (after last 'import ...' line).
+    lines = src.splitlines(True)
+    insert_at = 0
+    for i, ln in enumerate(lines):
+        if re.match(r"^\s*(import|from)\s+", ln):
+            insert_at = i + 1
+    lines.insert(insert_at, "\n" + helper_block + "\n")
+    src = "".join(lines)
+
+# 3) Replace the FACTUAL "Causal DAG paths (direct)" print with patient-specific.
+#    We search for a print that contains exactly that label in the factual section.
+src = re.sub(
+    r'print\(\s*f?"?Causal DAG paths \(direct\):\s*\{[^}]*\}"?\s*\)',
+    'patient_paths, direct_paths = get_patient_active_paths(graph, fired_rules)\n'
+    'if patient_paths:\n'
+    '    print(f"Causal DAG paths (active): {patient_paths}")\n'
+    'else:\n'
+    '    print(f"Causal DAG paths (direct): {direct_paths}")',
+    src
+)
+
+# 4) Replace the COUNTERFACTUAL "Causal DAG paths (direct)" print similarly.
+#    We look for the one that references fired_rules_cf (appears after CF rule evaluation).
+src = re.sub(
+    r'print\(\s*f?"?Causal DAG paths \(direct\):\s*\{[^}]*\}"?\s*\)',
+    'patient_paths_cf, direct_paths_cf = get_patient_active_paths(graph, fired_rules_cf)\n'
+    'if patient_paths_cf:\n'
+    '    print(f"Causal DAG paths (active): {patient_paths_cf}")\n'
+    'else:\n'
+    '    print(f"Causal DAG paths (direct): {direct_paths_cf}")',
+    src,
+    count=1  # the second occurrence (CF) will be handled by the loop below too
+)
+
+# Safety: if there are multiple "Causal DAG paths (direct)" prints, transform the rest,
+# picking fired_rules_cf when we appear *after* a CF heading.
+out = []
+cf_mode = False
+for ln in src.splitlines(True):
+    if re.search(r"^===\s*Counterfactual\s*\(Intervention\)\s*===", ln):
+        cf_mode = True
+    if re.search(r'^\s*print\(\s*f?"?Causal DAG paths \(direct\):', ln):
+        if cf_mode:
+            ln = (
+                'patient_paths_cf, direct_paths_cf = get_patient_active_paths(graph, fired_rules_cf)\n'
+                'if patient_paths_cf:\n'
+                '    print(f"Causal DAG paths (active): {patient_paths_cf}")\n'
+                'else:\n'
+                '    print(f"Causal DAG paths (direct): {direct_paths_cf}")\n'
+            )
+        else:
+            ln = (
+                'patient_paths, direct_paths = get_patient_active_paths(graph, fired_rules)\n'
+                'if patient_paths:\n'
+                '    print(f"Causal DAG paths (active): {patient_paths}")\n'
+                'else:\n'
+                '    print(f"Causal DAG paths (direct): {direct_paths}")\n'
+            )
+    out.append(ln)
+src = "".join(out)
+
+# 5) (Optional) ensure CF recomputes z-features BEFORE evaluating CF rules if scaler & features exist.
+#    Insert a tiny block just before the first occurrence of "fired_rules_cf =".
+src = re.sub(
+    r'(\n\s*fired_rules_cf\s*=\s*rule_engine\.evaluate\()',
+    '\n    # Recompute z-features under interventions if scaler/raw/tab available\n'
+    '    try:\n'
+    '        if "scaler" in globals() and scaler is not None:\n'
+    '            if "raw_features" in case_cf and case_cf.get("raw_features") is not None:\n'
+    '                case_cf["z_features"] = scaler.transform(case_cf["raw_features"].reshape(1, -1)).ravel()\n'
+    '            elif "tab_features" in case_cf and case_cf.get("tab_features") is not None:\n'
+    '                case_cf["z_features"] = scaler.transform(case_cf["tab_features"].reshape(1, -1)).ravel()\n'
+    '    except Exception:\n'
+    '        pass\n'
+    r'\1',
+    src, count=1
+)
+
+# Write backup + new file
+shutil.copyfile(TARGET, BACKUP)
+TARGET.write_text(src, encoding="utf-8")
+print(f"Patched {TARGET} ✓  (backup at {BACKUP})")

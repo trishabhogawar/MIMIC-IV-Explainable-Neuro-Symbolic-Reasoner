@@ -1,0 +1,14 @@
+[
+  "heart_rate",
+  "sbp",
+  "dbp",
+  "mbp",
+  "resp_rate",
+  "temperature",
+  "spo2",
+  "glucose",
+  "lactate",
+  "creatinine",
+  "bun",
+  "wbc"
+]
